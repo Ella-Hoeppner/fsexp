@@ -292,6 +292,26 @@ mod core_tests {
   }
 
   #[test]
+  fn stray_closer_at_top_level_is_an_error() {
+    assert_eq!(
+      Parser::new(multi_bracket_graph(), "a) (b)]").read_all_as_sexps(),
+      (
+        vec![leaf("a".to_string()), inner(vec![leaf("b".to_string())]),],
+        vec![
+          ParseError {
+            kind: ParseErrorKind::UnexpectedCloser(")".to_string()),
+            pos: 1..2
+          },
+          ParseError {
+            kind: ParseErrorKind::UnexpectedCloser("]".to_string()),
+            pos: 6..7
+          }
+        ]
+      )
+    );
+  }
+
+  #[test]
   fn prefix_op() {
     assert_eq!(
       Parser::new(quote_ast_graph(), "'hello!").read_next_as_sexp(),

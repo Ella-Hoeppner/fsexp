@@ -415,6 +415,17 @@ impl<'t, 's, S: Syntax> Parse<'t, 's, S> {
           .syntax
           .prefix_closer_in_context(&active_context_tag, remaining_text)
         {
+          if self.open_asts.is_empty() {
+            // Nothing is open for the closer to close: report it and skip it.
+            let closer_len = closer.len();
+            finish_terminal!();
+            errors.push(ParseError {
+              kind: ParseErrorKind::UnexpectedCloser(closer.to_string()),
+              pos: character_index..(character_index + closer_len),
+            });
+            skip_n_chars!(closer_len);
+            continue;
+          }
           errors.push(ParseError {
             kind: ParseErrorKind::UnexpectedCloser(closer.to_string()),
             pos: character_index..(character_index + closer.len()),
