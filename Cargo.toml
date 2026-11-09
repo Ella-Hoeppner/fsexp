@@ -5,4 +5,3 @@ edition = "2024"
 
 [dependencies]
 take_mut = "0.2.2"
-unicode-segmentation = "1.11.0"

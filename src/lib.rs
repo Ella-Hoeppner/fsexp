@@ -18,6 +18,8 @@ pub use syntax::Encloser;
 pub use syntax::EncloserOrOperator;
 pub use syntax::Operator;
 pub mod diff;
+#[cfg(test)]
+mod robustness_tests;
 
 pub fn standard_whitespace_chars() -> Vec<String> {
   vec![
@@ -1832,6 +1834,259 @@ mod core_tests {
           ])
         ])),
         vec![]
+      )
+    );
+  }
+
+  #[test]
+  fn overlapping_reserved_tokens_match_once() {
+    let syntax = StringTaggedSyntax::contextless_from_descriptions(
+      standard_whitespace_chars(),
+      None,
+      vec![("", "(", ")")],
+      vec![],
+    )
+    .with_reserved_tokens(["|", "||"]);
+    assert_eq!(
+      Parser::new(syntax, "a||b").read_all_as_sexps(),
+      (
+        vec![
+          leaf("a".to_string()),
+          leaf("||".to_string()),
+          leaf("b".to_string())
+        ],
+        vec![]
+      )
+    );
+  }
+
+  #[test]
+  fn reserved_tokens_leave_strings_and_comments_alone() {
+    let syntax = StringTaggedSyntax::from_descriptions(
+      "root",
+      vec![
+        (
+          "root",
+          false,
+          vec!["", "STRING", "COMMENT"],
+          None,
+          standard_whitespace_chars(),
+        ),
+        ("string", false, vec![], None, vec![]),
+        ("comment", true, vec![], None, vec![]),
+      ],
+      vec![
+        ("", "(", ")", None),
+        ("STRING", "\"", "\"", Some("string")),
+        ("COMMENT", ";", "\n", Some("comment")),
+      ],
+      vec![],
+    )
+    .with_reserved_tokens(["||"]);
+    assert_eq!(
+      Parser::new(syntax, "(a||b \"c||d\" ;e||f\n)").read_next_as_sexp(),
+      (
+        Some(inner(vec![
+          leaf("a".to_string()),
+          leaf("||".to_string()),
+          leaf("b".to_string()),
+          inner(vec![leaf("STRING".to_string()), leaf("c||d".to_string())]),
+          inner(vec![leaf("COMMENT".to_string()), leaf("e||f".to_string())]),
+        ])),
+        vec![]
+      )
+    );
+  }
+
+  #[test]
+  fn longest_opener_wins() {
+    let syntax = StringTaggedSyntax::contextless_from_descriptions(
+      standard_whitespace_chars(),
+      None,
+      vec![("LINE", ";", "\n"), ("BLOCK", ";*", "*;")],
+      vec![],
+    );
+    assert_eq!(
+      Parser::new(syntax, ";* a *;").read_next_as_sexp(),
+      (
+        Some(inner(vec![
+          leaf("BLOCK".to_string()),
+          leaf("a".to_string())
+        ])),
+        vec![]
+      )
+    );
+  }
+
+  #[test]
+  fn longest_operator_wins() {
+    let syntax = StringTaggedSyntax::contextless_from_descriptions(
+      standard_whitespace_chars(),
+      None,
+      vec![("", "(", ")")],
+      vec![("HASH", "#", 0, 1), ("DISCARD", "#_", 0, 1)],
+    );
+    assert_eq!(
+      Parser::new(syntax, "#_x").read_next_as_sexp(),
+      (
+        Some(inner(vec![
+          leaf("DISCARD".to_string()),
+          leaf("x".to_string())
+        ])),
+        vec![]
+      )
+    );
+  }
+
+  #[test]
+  fn longer_operator_beats_encloser_prefix() {
+    let syntax = StringTaggedSyntax::contextless_from_descriptions(
+      standard_whitespace_chars(),
+      None,
+      vec![("", "(", ")"), ("ANGLE", "<", ">")],
+      vec![("ARROW", "<-", 0, 1)],
+    );
+    assert_eq!(
+      Parser::new(syntax, "<-x").read_next_as_sexp(),
+      (
+        Some(inner(vec![
+          leaf("ARROW".to_string()),
+          leaf("x".to_string())
+        ])),
+        vec![]
+      )
+    );
+  }
+
+  #[test]
+  fn multi_character_closer_ends_the_span_after_it() {
+    let syntax = StringTaggedSyntax::contextless_from_descriptions(
+      standard_whitespace_chars(),
+      None,
+      vec![("", "(", ")"), ("BLOCK", ";*", "*;")],
+      vec![],
+    );
+    let (trees, errors) = Parser::new(syntax, ";* a *; (b c)").read_all();
+    assert_eq!(errors, vec![]);
+    assert_eq!(
+      trees
+        .iter()
+        .map(|tree| tree.position().span.clone())
+        .collect::<Vec<_>>(),
+      vec![0..7, 8..13]
+    );
+  }
+
+  #[test]
+  fn suffix_operator_span_covers_the_whole_operator() {
+    let syntax = StringTaggedSyntax::contextless_from_descriptions(
+      standard_whitespace_chars(),
+      None,
+      vec![("", "(", ")")],
+      vec![("BANG", "?!", 1, 0)],
+    );
+    let (trees, errors) = Parser::new(syntax, "x?! y").read_all();
+    assert_eq!(errors, vec![]);
+    assert_eq!(
+      trees
+        .iter()
+        .map(|tree| tree.position().span.clone())
+        .collect::<Vec<_>>(),
+      vec![0..3, 4..5]
+    );
+  }
+
+  #[test]
+  fn mismatched_closer_keeps_the_preceding_terminal() {
+    assert_eq!(
+      Parser::new(multi_bracket_graph(), "((a b]) c").read_all_as_sexps(),
+      (
+        vec![
+          inner(vec![inner(vec![
+            leaf("a".to_string()),
+            leaf("b".to_string())
+          ])]),
+          leaf("c".to_string())
+        ],
+        vec![ParseError {
+          kind: ParseErrorKind::UnexpectedCloser("]".to_string()),
+          pos: 5..6
+        }]
+      )
+    );
+  }
+
+  fn unfinished_operator_graph<'g>() -> StringTaggedSyntax<'g> {
+    StringTaggedSyntax::contextless_from_descriptions(
+      standard_whitespace_chars(),
+      None,
+      vec![("", "(", ")"), ("SQUARE", "[", "]")],
+      vec![("PAIR", "@", 0, 2), ("TILDE", "~", 0, 1)],
+    )
+  }
+
+  #[test]
+  fn closer_closes_every_unfinished_operator() {
+    assert_eq!(
+      Parser::new(unfinished_operator_graph(), "(@ ~) x").read_all_as_sexps(),
+      (
+        vec![
+          inner(vec![inner(vec![
+            leaf("PAIR".to_string()),
+            inner(vec![leaf("TILDE".to_string())])
+          ])]),
+          leaf("x".to_string())
+        ],
+        vec![
+          ParseError {
+            kind: ParseErrorKind::OperatorMissingRightArgument("~".to_string()),
+            pos: 3..4
+          },
+          ParseError {
+            kind: ParseErrorKind::OperatorMissingRightArgument("@".to_string()),
+            pos: 1..2
+          }
+        ]
+      )
+    );
+  }
+
+  #[test]
+  fn mismatched_closer_closes_unfinished_operators() {
+    assert_eq!(
+      Parser::new(unfinished_operator_graph(), "(~] x").read_all_as_sexps(),
+      (
+        vec![
+          inner(vec![inner(vec![leaf("TILDE".to_string())])]),
+          leaf("x".to_string())
+        ],
+        vec![
+          ParseError {
+            kind: ParseErrorKind::UnexpectedCloser("]".to_string()),
+            pos: 2..3
+          },
+          ParseError {
+            kind: ParseErrorKind::OperatorMissingRightArgument("~".to_string()),
+            pos: 1..2
+          }
+        ]
+      )
+    );
+  }
+
+  #[test]
+  fn stray_closer_under_an_operator_is_skipped() {
+    assert_eq!(
+      Parser::new(unfinished_operator_graph(), "~] a").read_all_as_sexps(),
+      (
+        vec![inner(vec![
+          leaf("TILDE".to_string()),
+          leaf("a".to_string())
+        ])],
+        vec![ParseError {
+          kind: ParseErrorKind::UnexpectedCloser("]".to_string()),
+          pos: 1..2
+        }]
       )
     );
   }

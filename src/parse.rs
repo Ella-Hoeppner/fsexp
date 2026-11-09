@@ -3,8 +3,6 @@ use std::{
   ops::Range,
 };
 
-use unicode_segmentation::UnicodeSegmentation;
-
 use crate::{
   ContextId,
   document::{Document, DocumentPosition, DocumentSyntaxTree},
@@ -231,6 +229,28 @@ impl<'t, 's, S: Syntax> Parse<'t, 's, S> {
       )
       .next()
   }
+  fn close_unfinished_operators(
+    &mut self,
+    closing_index: usize,
+  ) -> Vec<ParseError> {
+    let mut errors = vec![];
+    while let Some(OpenAst {
+      encloser_or_operator: EncloserOrOperator::Operator(operator),
+      encloser_or_operator_index,
+      ..
+    }) = self.open_asts.last()
+    {
+      errors.push(ParseError {
+        kind: ParseErrorKind::OperatorMissingRightArgument(
+          operator.op_str().to_string(),
+        ),
+        pos: *encloser_or_operator_index
+          ..(encloser_or_operator_index + operator.op_str().len()),
+      });
+      self.close_ast(closing_index);
+    }
+    errors
+  }
   pub(crate) fn complete(
     mut self,
     already_parsed_index: usize,
@@ -245,9 +265,14 @@ impl<'t, 's, S: Syntax> Parse<'t, 's, S> {
       return (self.inherited_top_level_asts, true, vec![]);
     }
 
-    let mut indexed_characters = self.text[beginning_index..]
-      .grapheme_indices(true)
-      .chain(std::iter::once((self.text.len() - beginning_index, " ")))
+    let text = self.text;
+    let mut indexed_characters = text[beginning_index..]
+      .char_indices()
+      .map(|(offset, c)| {
+        let start = beginning_index + offset;
+        (offset, &text[start..start + c.len_utf8()])
+      })
+      .chain(std::iter::once((text.len() - beginning_index, " ")))
       .peekable();
 
     let mut current_terminal_beginning: Option<usize> = None;
@@ -292,10 +317,16 @@ impl<'t, 's, S: Syntax> Parse<'t, 's, S> {
           }
         };
       }
-      macro_rules! skip_n_chars {
+      // Advances past the rest of a marker `$n` bytes long that starts at
+      // the current character.
+      macro_rules! skip_bytes {
         ($n:expr) => {
-          if $n > 1 {
-            indexed_characters.nth($n - 2);
+          let marker_end = character_index + $n;
+          while indexed_characters
+            .peek()
+            .is_some_and(|(offset, _)| beginning_index + offset < marker_end)
+          {
+            indexed_characters.next();
           }
         };
       }
@@ -315,21 +346,29 @@ impl<'t, 's, S: Syntax> Parse<'t, 's, S> {
 
         let active_context_tag = self.active_context();
 
-        let mut matched_reserved = false;
-        for reserved_token in self.syntax.reserved_tokens() {
-          if remaining_text.starts_with(reserved_token) {
-            push_ast_and_maybe_return!(DocumentSyntaxTree::Leaf(
-              DocumentPosition::new(
-                character_index..character_index + reserved_token.len(),
-                vec![],
-              ),
-              reserved_token.to_string(),
-            ));
-            skip_n_chars!(reserved_token.len());
-            matched_reserved = true;
-          }
-        }
-        if matched_reserved {
+        // Markers match longest-first, so one that's a prefix of another
+        // (`;` and `;*`) never shadows it, whatever order they're listed in.
+        // Reserved tokens only split text in contexts with structure (some
+        // encloser or operator), so strings and plain comments keep them.
+        let structured_context = !active_context.enclosers().is_empty()
+          || !active_context.operators().is_empty();
+        if structured_context
+          && let Some(reserved_token) = self
+            .syntax
+            .reserved_tokens()
+            .filter(|token| remaining_text.starts_with(token))
+            .max_by_key(|token| token.len())
+        {
+          let reserved_token = reserved_token.to_string();
+          finish_terminal!();
+          push_ast_and_maybe_return!(DocumentSyntaxTree::Leaf(
+            DocumentPosition::new(
+              character_index..character_index + reserved_token.len(),
+              vec![],
+            ),
+            reserved_token.clone(),
+          ));
+          skip_bytes!(reserved_token.len());
           continue;
         }
 
@@ -338,99 +377,98 @@ impl<'t, 's, S: Syntax> Parse<'t, 's, S> {
         {
           let closer_len = awaited_closer.len();
           finish_terminal!();
+          errors.append(&mut self.close_unfinished_operators(character_index));
 
-          if let Some(OpenAst {
-            encloser_or_operator,
-            encloser_or_operator_index,
-            ..
-          }) = self.open_asts.last()
-            && let EncloserOrOperator::Operator(operator) = encloser_or_operator
+          if let Some(completed_ast) =
+            self.close_ast(character_index + closer_len)
           {
-            errors.push(ParseError {
-              kind: ParseErrorKind::OperatorMissingRightArgument(
-                operator.op_str().to_string(),
-              ),
-              pos: *encloser_or_operator_index
-                ..(encloser_or_operator_index + operator.op_str().len()),
-            });
-            self.close_ast(character_index + 1);
-          }
-
-          if let Some(completed_ast) = self.close_ast(character_index + 1) {
             let mut top_level_asts = self.inherited_top_level_asts;
             top_level_asts.push(completed_ast);
             return (top_level_asts, false, errors);
           } else {
-            skip_n_chars!(closer_len);
+            skip_bytes!(closer_len);
             continue;
           }
         }
 
-        for encloser in self.syntax.context(&active_context_tag).enclosers() {
-          let beginning_marker = encloser.opening_encloser_str();
-          if remaining_text.starts_with(beginning_marker) {
-            finish_terminal!();
-            self.open_asts.push(OpenAst {
-              opening_index: character_index,
-              encloser_or_operator_index: character_index,
-              encloser_or_operator: EncloserOrOperator::Encloser(
-                encloser.clone(),
-              ),
-              subtrees: vec![],
-              left_args_consumed: 0,
-            });
-            skip_n_chars!(beginning_marker.len());
-            continue 'outer;
+        let context = self.syntax.context(&active_context_tag);
+        let opener = context
+          .enclosers()
+          .iter()
+          .filter(|encloser| {
+            remaining_text.starts_with(encloser.opening_encloser_str())
+          })
+          .max_by_key(|encloser| encloser.opening_encloser_str().len())
+          .cloned();
+        let operator = context
+          .operators()
+          .iter()
+          .filter(|operator| remaining_text.starts_with(operator.op_str()))
+          .max_by_key(|operator| operator.op_str().len())
+          .cloned();
+        let operator = operator.filter(|operator| {
+          opener.as_ref().is_none_or(|opener| {
+            operator.op_str().len() > opener.opening_encloser_str().len()
+          })
+        });
+
+        if let Some(operator) = operator {
+          let op_len = operator.op_str().len();
+          finish_terminal!();
+          let (leftward_args, mut consumption_errors) =
+            self.consume_left_asts(&operator, character_index);
+          errors.append(&mut consumption_errors);
+          let right_args = operator.right_args();
+          self.open_asts.push(OpenAst {
+            opening_index: leftward_args
+              .first()
+              .map(|first_arg| first_arg.position().start())
+              .unwrap_or(character_index),
+            encloser_or_operator: EncloserOrOperator::Operator(operator),
+            encloser_or_operator_index: character_index,
+            left_args_consumed: leftward_args.len(),
+            subtrees: leftward_args,
+          });
+          skip_bytes!(op_len);
+          if right_args == 0 {
+            close_ast_and_maybe_return!(character_index + op_len, false)
           }
+          continue 'outer;
         }
 
-        for operator in self.syntax.context(&active_context_tag).operators() {
-          let op_marker = operator.op_str();
-          if remaining_text.starts_with(op_marker) {
-            finish_terminal!();
-            let (leftward_args, mut consumption_errors) =
-              self.consume_left_asts(operator, character_index);
-            errors.append(&mut consumption_errors);
-            self.open_asts.push(OpenAst {
-              opening_index: leftward_args
-                .first()
-                .map(|first_arg| first_arg.position().start())
-                .unwrap_or(character_index),
-              encloser_or_operator: EncloserOrOperator::Operator(
-                operator.clone(),
-              ),
-              encloser_or_operator_index: character_index,
-              left_args_consumed: leftward_args.len(),
-              subtrees: leftward_args,
-            });
-            skip_n_chars!(op_marker.len());
-            if operator.right_args() == 0 {
-              close_ast_and_maybe_return!(character_index + 1, false)
-            }
-            continue 'outer;
-          }
+        if let Some(encloser) = opener {
+          let opener_len = encloser.opening_encloser_str().len();
+          finish_terminal!();
+          self.open_asts.push(OpenAst {
+            opening_index: character_index,
+            encloser_or_operator_index: character_index,
+            encloser_or_operator: EncloserOrOperator::Encloser(encloser),
+            subtrees: vec![],
+            left_args_consumed: 0,
+          });
+          skip_bytes!(opener_len);
+          continue 'outer;
         }
 
         if let Some(closer) = self
           .syntax
           .prefix_closer_in_context(&active_context_tag, remaining_text)
         {
-          if self.open_asts.is_empty() {
-            // Nothing is open for the closer to close: report it and skip it.
-            let closer_len = closer.len();
-            finish_terminal!();
-            errors.push(ParseError {
-              kind: ParseErrorKind::UnexpectedCloser(closer.to_string()),
-              pos: character_index..(character_index + closer_len),
-            });
-            skip_n_chars!(closer_len);
-            continue;
-          }
+          let closer_len = closer.len();
+          finish_terminal!();
           errors.push(ParseError {
             kind: ParseErrorKind::UnexpectedCloser(closer.to_string()),
-            pos: character_index..(character_index + closer.len()),
+            pos: character_index..(character_index + closer_len),
           });
-          close_ast_and_maybe_return!(character_index + 1, false)
+          // A mismatched closer still closes the innermost open encloser. With
+          // no encloser open, it's just skipped.
+          if self.awaited_closer().is_some() {
+            errors
+              .append(&mut self.close_unfinished_operators(character_index));
+            close_ast_and_maybe_return!(character_index + closer_len, false);
+          }
+          skip_bytes!(closer_len);
+          continue;
         }
 
         if current_terminal_beginning.is_none() {

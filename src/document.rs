@@ -1,6 +1,5 @@
 use std::{fmt::Debug, ops::Range};
 use take_mut::take;
-use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
   Ast, Encloser, Operator, ParseError, Parser, SyntaxTree,
@@ -289,7 +288,6 @@ impl<E: Encloser + IdStr, O: Operator + IdStr> From<DocumentSyntaxTree<E, O>>
 
 #[derive(Debug, Clone)]
 pub struct Document<S: Syntax> {
-  grapheme_indeces: Vec<usize>,
   newline_indeces: Vec<usize>,
   pub syntax: S,
   pub syntax_trees: Vec<DocumentSyntaxTree<S::E, S::O>>,
@@ -304,18 +302,8 @@ pub struct InvalidDocumentCharPos;
 
 impl<'t, S: Syntax> From<Parser<'t, S>> for Document<S> {
   fn from(mut parser: Parser<'t, S>) -> Self {
-    let (mut grapheme_indeces, newline_indeces) =
-      parser.text.grapheme_indices(true).fold(
-        (vec![], vec![]),
-        |(mut grapheme_indeces, mut newline_indeces), (i, char)| {
-          grapheme_indeces.push(i);
-          if char == "\n" {
-            newline_indeces.push(i);
-          }
-          (grapheme_indeces, newline_indeces)
-        },
-      );
-    grapheme_indeces.push(parser.text.len());
+    let newline_indeces =
+      parser.text.match_indices('\n').map(|(i, _)| i).collect();
     let (mut syntax_trees, parsing_failures) = parser.read_all();
     syntax_trees = syntax_trees
       .into_iter()
@@ -323,7 +311,6 @@ impl<'t, S: Syntax> From<Parser<'t, S>> for Document<S> {
       .map(|(i, tree)| tree.calculate_paths(vec![i]))
       .collect();
     Self {
-      grapheme_indeces,
       newline_indeces,
       syntax_trees,
       parsing_failures,
@@ -355,10 +342,7 @@ impl<S: Syntax> Document<S> {
     text: &'t str,
   ) -> Result<&'t str, InvalidTreePath> {
     let pos = self.get_subtree(path)?.position();
-    Ok(
-      &text
-        [self.grapheme_indeces[pos.start()]..self.grapheme_indeces[pos.end()]],
-    )
+    Ok(&text[pos.start()..pos.end()])
   }
   pub fn innermost_predicate_path(
     &self,
