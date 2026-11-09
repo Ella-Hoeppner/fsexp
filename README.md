@@ -1,6 +1,6 @@
 # fsexp
 
-**F**lexible **S**-**Exp**ression parser, a customizable parser for lisp-like languages with support for a bit of extra syntactic sugar.
+**F**lexible **S**-**Exp**ression parser, a customizable parser for lisp-like languages with support for a bit of extra syntactic sugar. Created mainly for use in [easl](https://github.com/Ella-Hoeppner/easl), but it's general enough to be useful for other projects.
 
 ## Explanation
 

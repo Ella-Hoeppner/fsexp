@@ -1,7 +1,15 @@
 [package]
 name = "fsexp"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+description = "A configurable parser for Lisp-like languages"
+license = "MIT"
+repository = "https://github.com/Ella-Hoeppner/fsexp"
+readme = "README.md"
+keywords = ["parser", "s-expression", "lisp", "sexp"]
+categories = ["parser-implementations"]
+exclude = ["CLAUDE.md", "todo.md"]
 
 [dependencies]
 take_mut = "0.2.2"

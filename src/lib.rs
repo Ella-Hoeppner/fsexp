@@ -1,6 +1,7 @@
 mod ast;
 pub mod document;
-pub mod examples;
+#[cfg(test)]
+mod examples;
 pub mod formatting;
 mod parse;
 mod parser;
